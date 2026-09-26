@@ -1,0 +1,4 @@
+gtfs-nl.zip
+firmware/.pio/
+firmware/include/secrets.h
+.DS_Store
