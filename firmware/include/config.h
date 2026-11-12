@@ -16,11 +16,17 @@
 #define BUS_TPC   "30001366"           // OVapi platform code (Ataturk, direction Olof Palmeplein)
 #define BUS_LINE  "36"
 
-#define ROWS 4                                        // departures shown per column
+#define ROWS 3                                        // departures per column: next one big, then 2 more
 #define LIVE_INTERVAL_MS      (30UL * 1000)           // live bus refresh
 #define LIVE_MAX_AGE_S        (3 * 60)                // older live data -> fall back to schedule
 #define SCHEDULE_INTERVAL_MS  (6UL * 60 * 60 * 1000)  // re-download departures.json
 #define SCHEDULE_RETRY_MS     (5UL * 60 * 1000)       // retry after a failed download
+
+// Weather (location: HOME_LAT / HOME_LON in secrets.h)
+#define RAIN_INTERVAL_MS      (5UL * 60 * 1000)       // Buienradar updates every 5 min
+#define TEMP_INTERVAL_MS      (15UL * 60 * 1000)
+#define WEATHER_RETRY_MS      (60UL * 1000)           // retry after a failed fetch
+#define RAIN_STALE_MS         (20UL * 60 * 1000)      // older forecast -> "unavailable"
 
 // T-Display-S3 pins
 #define PIN_POWER_ON 15   // must be HIGH to power the display (needed on battery)

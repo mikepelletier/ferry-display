@@ -1,6 +1,7 @@
 // Ferry + bus departure board for the LilyGO T-Display-S3
 //  - Ferry NDSM -> Centraal: scheduled times from departures.json (GitHub, cached in flash)
 //  - Bus 36 Ataturk -> Olof Palmeplein: live from OVapi, schedule as fallback
+//  - Rain forecast for the next 2 hours (Buienradar) and temperature (Open-Meteo)
 // Buttons: BOOT (left) = refresh now, KEY (right) = backlight on/off
 
 #include <Arduino.h>
@@ -16,6 +17,7 @@
 
 #include "config.h"
 #include "secrets.h"
+#include "weather.h"
 
 static const char* CACHE_FILE = "/departures.json";
 
@@ -37,7 +39,12 @@ String scheduleStamp;  // "generated" field
 std::vector<Dep> liveBus;
 time_t liveFetchedAt = 0;
 
+RainData rain;
+TempData temp;
+
 uint32_t lastScheduleTry = 0, lastScheduleOk = 0, lastLiveTry = 0, lastDraw = 0, lastWifiTry = 0;
+uint32_t lastRainTry = 0, lastTempTry = 0;
+bool rainLastOk = false, tempLastOk = false;
 bool backlightOn = true;
 bool forceRefresh = false;
 
@@ -205,44 +212,133 @@ void currentBus(time_t now, std::vector<Dep>& out) {
 
 // ---------- drawing ----------
 
+#define RGB565(r, g, b) (uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))
+static const uint16_t C_FERRY    = RGB565(0x5D, 0xCA, 0xA5);
+static const uint16_t C_BUS      = RGB565(0xEF, 0x9F, 0x27);
+static const uint16_t C_SUB      = RGB565(0xB4, 0xB2, 0xA9);
+static const uint16_t C_DIV      = RGB565(0x44, 0x44, 0x41);
+static const uint16_t C_RAIN     = RGB565(0x18, 0x5F, 0xA5);
+static const uint16_t C_RAINLINE = RGB565(0x85, 0xB7, 0xEB);
+static const uint16_t C_AXIS     = RGB565(0x5F, 0x5E, 0x5A);
+static const uint16_t C_TICK     = RGB565(0x88, 0x87, 0x80);
+static const uint16_t C_GRID     = RGB565(0x2C, 0x2C, 0x2A);
+
+// Rain graph area (screen is 320 x 170)
+static const int G_LEFT = 10, G_RIGHT = 310, G_TOP = 100, G_BOTTOM = 148;
+
+// One column: title (+ live dot), next departure as a big countdown, then the next ones
 void drawColumn(TFT_eSPI& g, int x, const char* title, uint16_t color,
                 const std::vector<Dep>& deps, time_t now, bool showLiveDot, bool isLive) {
-  const int w = 160;
   g.setTextDatum(TL_DATUM);
   g.setTextColor(color, TFT_BLACK);
-  g.drawString(title, x + 6, 26, 2);
-  if (showLiveDot) g.fillCircle(x + w - 10, 34, 4, isLive ? TFT_GREEN : TFT_DARKGREY);
-  g.drawFastHLine(x + 4, 44, w - 8, TFT_DARKGREY);
+  g.drawString(title, x, 3, 2);
+  if (showLiveDot) g.fillCircle(x + g.textWidth(title, 2) + 8, 11, 3, isLive ? TFT_GREEN : TFT_DARKGREY);
 
   if (deps.empty()) {
-    g.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    g.drawString(haveSchedule ? "no departures" : "no data", x + 6, 60, 2);
+    g.setTextColor(C_SUB, TFT_BLACK);
+    g.drawString(haveSchedule ? "no departures" : "no data", x, 30, 2);
     return;
   }
 
-  for (int i = 0; i < ROWS && i < (int)deps.size(); i++) {
-    const Dep& d = deps[i];
-    int y = 50 + i * 30;
-    long mins = (long)((d.t - now + 59) / 60);
-    if (mins < 0) mins = 0;
+  const Dep& d = deps[0];
+  long mins = (long)((d.t - now + 59) / 60);
+  if (mins < 0) mins = 0;
+  String big;
+  if (mins == 0) big = "now";
+  else if (mins <= 60) big = String(mins) + " min";
+  else big = hhmm(d.t);
+  g.setTextColor(mins <= 1 ? TFT_ORANGE : TFT_WHITE, TFT_BLACK);
+  g.drawString(big, x, 24, 4);
 
-    uint16_t tc = mins <= 1 ? TFT_ORANGE : TFT_WHITE;
-    g.setTextColor(tc, TFT_BLACK);
-    g.setTextDatum(TL_DATUM);
-    g.drawString(hhmm(d.t), x + 6, y, 4);
-
-    // delay in red, e.g. +3
-    long delay = (long)((d.t - d.planned) / 60);
-    if (d.live && delay >= 1) {
-      g.setTextColor(TFT_RED, TFT_BLACK);
-      g.drawString("+" + String(delay), x + 80, y + 6, 2);
-    }
-
-    // minutes until departure, right aligned
-    g.setTextDatum(TR_DATUM);
-    g.setTextColor(mins <= 1 ? TFT_ORANGE : TFT_LIGHTGREY, TFT_BLACK);
-    g.drawString(mins == 0 ? "now" : String(mins) + "'", x + w - 6, y + 6, 2);
+  // delay in red, e.g. +3
+  long delay = (long)((d.t - d.planned) / 60);
+  if (d.live && delay >= 1) {
+    g.setTextColor(TFT_RED, TFT_BLACK);
+    g.drawString("+" + String(delay), x + g.textWidth(big, 4) + 6, 30, 2);
   }
+
+  if (deps.size() > 1) {
+    String sub = "then " + hhmm(deps[1].t);
+    for (int i = 2; i < ROWS && i < (int)deps.size(); i++) sub += ", " + hhmm(deps[i].t);
+    g.setTextColor(C_SUB, TFT_BLACK);
+    g.drawString(sub, x, 52, 2);
+  }
+}
+
+// Bottom part: temperature, rain summary and the 2-hour rain graph
+void drawWeather(TFT_eSPI& g) {
+  char buf[32];
+  g.setTextDatum(TL_DATUM);
+
+  // temperature with a drawn degree symbol (the built-in fonts don't have one)
+  if (temp.valid) {
+    snprintf(buf, sizeof buf, "%.1f", temp.celsius);
+    g.setTextColor(TFT_WHITE, TFT_BLACK);
+    g.drawString(buf, G_LEFT, 78, 2);
+    g.drawCircle(G_LEFT + g.textWidth(buf, 2) + 3, 81, 2, TFT_WHITE);
+  }
+  g.drawFastHLine(G_LEFT, G_BOTTOM, G_RIGHT - G_LEFT, C_AXIS);
+
+  bool rainOk = rain.valid && millis() - rain.fetchedAt < RAIN_STALE_MS;
+  if (WiFi.status() != WL_CONNECTED) {
+    g.setTextColor(TFT_RED, TFT_BLACK);
+    g.drawString("WiFi offline", 60, 78, 2);
+  } else if (!rainOk) {
+    g.setTextColor(C_SUB, TFT_BLACK);
+    g.drawString("Rain forecast unavailable", 60, 78, 2);
+  }
+  if (!rainOk) return;
+
+  float maxMm;
+  rainSummary(rain, buf, sizeof buf, maxMm);
+  if (WiFi.status() == WL_CONNECTED) {  // offline: keep showing "WiFi offline" instead
+    g.setTextColor(C_RAINLINE, TFT_BLACK);
+    g.drawString(buf, 60, 78, 2);
+  }
+  if (maxMm >= 0.1f) {
+    snprintf(buf, sizeof buf, "max %.1f mm/h", maxMm);
+    g.setTextDatum(TR_DATUM);
+    g.setTextColor(C_SUB, TFT_BLACK);
+    g.drawString(buf, G_RIGHT, 78, 2);
+  }
+
+  // dashed guide lines at 1 mm/h and 10 mm/h
+  const int h = G_BOTTOM - G_TOP;
+  const int y1mm = G_BOTTOM - (int)(rainLevel(109) * h);
+  for (int gx = G_LEFT; gx < G_RIGHT; gx += 6) {
+    g.drawFastHLine(gx, y1mm, 3, C_GRID);
+    g.drawFastHLine(gx, G_TOP, 3, C_GRID);
+  }
+
+  // filled area under the forecast with a 2px line on top
+  const int n = rain.count;
+  int px[25], py[25];
+  for (int i = 0; i < n; i++) {
+    px[i] = G_LEFT + (long)i * (G_RIGHT - G_LEFT) / (n - 1);
+    py[i] = G_BOTTOM - (int)roundf(rainLevel(rain.value[i]) * h);
+  }
+  for (int i = 0; i < n - 1; i++) {
+    g.fillTriangle(px[i], G_BOTTOM, px[i], py[i], px[i + 1], py[i + 1], C_RAIN);
+    g.fillTriangle(px[i], G_BOTTOM, px[i + 1], py[i + 1], px[i + 1], G_BOTTOM, C_RAIN);
+  }
+  for (int i = 0; i < n - 1; i++) {
+    if (py[i] < G_BOTTOM || py[i + 1] < G_BOTTOM) {
+      g.drawLine(px[i], py[i], px[i + 1], py[i + 1], C_RAINLINE);
+      g.drawLine(px[i], py[i] - 1, px[i + 1], py[i + 1] - 1, C_RAINLINE);
+    }
+  }
+  g.drawFastHLine(G_LEFT, G_BOTTOM, G_RIGHT - G_LEFT, C_AXIS);
+  g.drawFastVLine(G_LEFT, G_TOP, h, C_SUB);
+
+  // time labels: now, +30, +60, +90 min, end
+  g.setTextColor(C_TICK, TFT_BLACK);
+  g.setTextDatum(TL_DATUM);
+  g.drawString("now", G_LEFT, 151, 2);
+  g.setTextDatum(TC_DATUM);
+  for (int k = 6; k <= 18; k += 6)
+    if (k < n - 1) g.drawString(rain.time[k], px[k], 151, 2);
+  g.setTextDatum(TR_DATUM);
+  g.drawString(rain.time[n - 1], G_RIGHT, 151, 2);
 }
 
 void drawStatus(const char* line1, const char* line2 = "") {
@@ -260,23 +356,22 @@ void drawBoard() {
   if (useSprite) spr.fillSprite(TFT_BLACK);
   else tft.fillScreen(TFT_BLACK);
 
-  // header: status left, clock right
-  g.setTextDatum(TL_DATUM);
-  bool wifiOk = WiFi.status() == WL_CONNECTED;
-  g.setTextColor(wifiOk ? TFT_DARKGREY : TFT_RED, TFT_BLACK);
-  g.drawString(wifiOk ? "Departures" : "WiFi offline", 6, 3, 2);
-  g.setTextDatum(TR_DATUM);
-  g.setTextColor(TFT_WHITE, TFT_BLACK);
-  g.drawString(hhmm(now), 314, 3, 2);
-
   std::vector<Dep> ferry, bus;
   collectScheduled(FERRY_KEY, now, ferry);
   currentBus(now, bus);
   bool busLive = !bus.empty() && bus[0].live;
 
-  drawColumn(g, 0, FERRY_TITLE, TFT_CYAN, ferry, now, false, false);
-  g.drawFastVLine(160, 24, 146, TFT_DARKGREY);
-  drawColumn(g, 160, BUS_TITLE, TFT_YELLOW, bus, now, true, busLive);
+  drawColumn(g, 8, FERRY_TITLE, C_FERRY, ferry, now, false, false);
+  drawColumn(g, 168, BUS_TITLE, C_BUS, bus, now, true, busLive);
+
+  // clock, top right
+  g.setTextDatum(TR_DATUM);
+  g.setTextColor(TFT_WHITE, TFT_BLACK);
+  g.drawString(hhmm(now), 312, 3, 2);
+
+  g.drawFastVLine(160, 4, 64, C_DIV);
+  g.drawFastHLine(8, 72, 304, C_DIV);
+  drawWeather(g);
 
   if (useSprite) spr.pushSprite(0, 0);
 }
@@ -350,6 +445,16 @@ void loop() {
     if (forceRefresh || lastLiveTry == 0 || ms - lastLiveTry > LIVE_INTERVAL_MS) {
       lastLiveTry = ms;
       fetchLive();
+    }
+    if (forceRefresh || lastRainTry == 0 ||
+        ms - lastRainTry > (rainLastOk ? RAIN_INTERVAL_MS : WEATHER_RETRY_MS)) {
+      lastRainTry = ms;
+      rainLastOk = fetchRain(rain);
+    }
+    if (forceRefresh || lastTempTry == 0 ||
+        ms - lastTempTry > (tempLastOk ? TEMP_INTERVAL_MS : WEATHER_RETRY_MS)) {
+      lastTempTry = ms;
+      tempLastOk = fetchTemp(temp);
     }
     forceRefresh = false;
   }

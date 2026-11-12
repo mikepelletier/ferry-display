@@ -1,6 +1,7 @@
 # Ferry + bus departure board (LilyGO T-Display-S3)
 
 Left: ferry NDSM → Centraal (scheduled). Right: bus 36 Atatürk → Olof Palmeplein (live via OVapi, schedule as fallback).
+Bottom: rain forecast for the next 2 hours (Buienradar) and current temperature (Open-Meteo); clock top right.
 Buttons: **BOOT** (left) = refresh now, **KEY** (right) = backlight on/off.
 
 ```
@@ -29,7 +30,7 @@ Data URL for the ESP32:
 ```zsh
 brew install platformio                       # once
 cd firmware
-cp include/secrets.h.example include/secrets.h   # then edit WiFi + DATA_URL
+cp include/secrets.h.example include/secrets.h   # then edit WiFi, DATA_URL and HOME_LAT/HOME_LON
 pio run -t upload                             # build + flash over USB-C
 pio device monitor                            # serial log (Ctrl+C to quit)
 ```
